@@ -40,6 +40,12 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hashicorp/hcl2/gohcl"
+
+	"github.com/hashicorp/hcl2/hcl"
+
+	"perkeep.org/pkg/configs"
+
 	"perkeep.org/internal/amazon/s3"
 	"perkeep.org/pkg/blob"
 	"perkeep.org/pkg/blobserver"
@@ -82,6 +88,146 @@ func (s *s3Storage) String() string {
 		return fmt.Sprintf("\"s3\" blob storage at host %q, bucket %q, directory %q", s.hostname, s.bucket, s.dirPrefix)
 	}
 	return fmt.Sprintf("\"s3\" blob storage at host %q, bucket %q", s.hostname, s.bucket)
+}
+
+// NewFromHCLConfig would actually be newFromHCLConfig in a real implementation,
+// and accessed only indirectly via the blobserver constructor registry.
+func NewFromHCLConfig(l blobserver.Loader, config *configs.Storage) (blobserver.Storage, error) {
+	type rawConfig struct {
+		Bucket    hcl.Expression `hcl:"bucket"`
+		Hostname  *string        `hcl:"hostname"`
+		CacheSize *int64         `hcl:"cache_size"`
+
+		AccessKeyID     hcl.Expression `hcl:"aws_access_key_id"`
+		SecretAccessKey string         `hcl:"aws_secret_access_key"`
+
+		SkipStartupCheck *bool `hcl:"skip_startup_check"`
+	}
+
+	var raw rawConfig
+	diags := gohcl.DecodeBody(config.Config, config.EvalContext, &raw)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+
+	hostname := "s3.amazonaws.com"
+	if raw.Hostname != nil {
+		hostname = *raw.Hostname
+	}
+
+	cacheSize := int64(32 << 20)
+	if raw.CacheSize != nil {
+		cacheSize = *raw.CacheSize
+	}
+
+	var accessKeyID string
+	moreDiags := gohcl.DecodeExpression(raw.AccessKeyID, config.EvalContext, &accessKeyID)
+	diags = append(diags, moreDiags...)
+	accessKeyRange := raw.AccessKeyID.Range()
+	if moreDiags.HasErrors() {
+		return nil, diags
+	}
+
+	client := &s3.Client{
+		Auth: &s3.Auth{
+			AccessKey:       accessKeyID,
+			SecretAccessKey: raw.SecretAccessKey,
+			Hostname:        hostname,
+		},
+		PutGate: syncutil.NewGate(maxParallelHTTP),
+		// TODO: optional transport, as in newFromConfigWithTransport below
+	}
+
+	var bucket string
+	moreDiags = gohcl.DecodeExpression(raw.Bucket, config.EvalContext, &bucket)
+	diags = append(diags, moreDiags...)
+	bucketRange := raw.Bucket.Range()
+	if moreDiags.HasErrors() {
+		return nil, diags
+	}
+
+	var dirPrefix string
+	if parts := strings.SplitN(bucket, "/", 2); len(parts) > 1 {
+		dirPrefix = parts[1]
+		bucket = parts[0]
+	}
+	if dirPrefix != "" && !strings.HasSuffix(dirPrefix, "/") {
+		dirPrefix += "/"
+	}
+
+	sto := &s3Storage{
+		s3Client:  client,
+		bucket:    bucket,
+		dirPrefix: dirPrefix,
+		hostname:  hostname,
+	}
+
+	skipStartupCheck := false
+	if raw.SkipStartupCheck != nil {
+		skipStartupCheck = *raw.SkipStartupCheck
+	}
+
+	ctx := context.Background() // TODO: 5 min timeout or something?
+	if !skipStartupCheck {
+		_, err := client.ListBucket(ctx, sto.bucket, "", 1)
+		if serr, ok := err.(*s3.Error); ok {
+			switch serr.AmazonCode {
+			case "NoSuchBucket":
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid S3 bucket",
+					Detail:   fmt.Sprintf("There is no bucket named %q.", bucket),
+					Subject:  &bucketRange, // report at the location of the bucket argument
+				})
+				return nil, diags
+			case "InvalidAccessKeyId":
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid AWS Access Key ID",
+					Detail:   fmt.Sprintf("The given access key id %q was refused by the S3 API.", accessKeyID),
+					Subject:  &accessKeyRange, // report at the location of the access key argument
+				})
+				return nil, diags
+			}
+
+			// This code appears when the hostname has dots in it:
+			if serr.AmazonCode == "PermanentRedirect" {
+				loc, lerr := client.BucketLocation(ctx, sto.bucket)
+				if lerr != nil {
+					return nil, fmt.Errorf("Wrong server for bucket %q; and error determining bucket's location: %v", sto.bucket, lerr)
+				}
+				client.Auth.Hostname = loc
+				_, err = client.ListBucket(ctx, sto.bucket, "", 1)
+				if err == nil {
+					log.Printf("Warning: s3 server should be %q, not %q. Change config file to avoid start-up latency.", client.Auth.Hostname, hostname)
+				}
+			}
+
+			// This path occurs when the user set the
+			// wrong server, or didn't set one at all, but
+			// the bucket doesn't have dots in it:
+			if serr.UseEndpoint != "" {
+				// UseEndpoint will be e.g. "brads3test-ca.s3-us-west-1.amazonaws.com"
+				// But we only want the "s3-us-west-1.amazonaws.com" part.
+				client.Auth.Hostname = strings.TrimPrefix(serr.UseEndpoint, sto.bucket+".")
+				_, err = client.ListBucket(ctx, sto.bucket, "", 1)
+				if err == nil {
+					log.Printf("Warning: s3 server should be %q, not %q. Change config file to avoid start-up latency.", client.Auth.Hostname, hostname)
+				}
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("Error listing bucket %s: %v", sto.bucket, err)
+		}
+	}
+
+	if cacheSize != 0 {
+		// This has two layers of LRU caching (proxycache and memory).
+		// We make the outer one 4x the size so that it doesn't evict from the
+		// underlying one when it's about to perform its own eviction.
+		return proxycache.New(cacheSize<<2, memory.NewCache(cacheSize), sto), nil
+	}
+	return sto, nil
 }
 
 func newFromConfig(l blobserver.Loader, config jsonconfig.Obj) (blobserver.Storage, error) {
